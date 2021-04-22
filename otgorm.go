@@ -3,11 +3,10 @@ package otgorm
 import (
 	"context"
 	"fmt"
-	"strings"
-
-	"github.com/jinzhu/gorm"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
+	"gorm.io/gorm"
+	"strings"
 )
 
 const (
@@ -43,44 +42,43 @@ func newCallbacks() *callbacks {
 	return &callbacks{}
 }
 
-func (c *callbacks) beforeCreate(scope *gorm.Scope)   { c.before(scope) }
-func (c *callbacks) afterCreate(scope *gorm.Scope)    { c.after(scope, "INSERT") }
-func (c *callbacks) beforeQuery(scope *gorm.Scope)    { c.before(scope) }
-func (c *callbacks) afterQuery(scope *gorm.Scope)     { c.after(scope, "SELECT") }
-func (c *callbacks) beforeUpdate(scope *gorm.Scope)   { c.before(scope) }
-func (c *callbacks) afterUpdate(scope *gorm.Scope)    { c.after(scope, "UPDATE") }
-func (c *callbacks) beforeDelete(scope *gorm.Scope)   { c.before(scope) }
-func (c *callbacks) afterDelete(scope *gorm.Scope)    { c.after(scope, "DELETE") }
-func (c *callbacks) beforeRowQuery(scope *gorm.Scope) { c.before(scope) }
-func (c *callbacks) afterRowQuery(scope *gorm.Scope)  { c.after(scope, "") }
+func (c *callbacks) beforeCreate(db *gorm.DB)   { c.before(db) }
+func (c *callbacks) afterCreate(db *gorm.DB)    { c.after(db, "INSERT") }
+func (c *callbacks) beforeQuery(db *gorm.DB)    { c.before(db) }
+func (c *callbacks) afterQuery(db *gorm.DB)     { c.after(db, "SELECT") }
+func (c *callbacks) beforeUpdate(db *gorm.DB)   { c.before(db) }
+func (c *callbacks) afterUpdate(db *gorm.DB)    { c.after(db, "UPDATE") }
+func (c *callbacks) beforeDelete(db *gorm.DB)   { c.before(db) }
+func (c *callbacks) afterDelete(db *gorm.DB)    { c.after(db, "DELETE") }
+func (c *callbacks) beforeRowQuery(db *gorm.DB) { c.before(db) }
+func (c *callbacks) afterRowQuery(db *gorm.DB)  { c.after(db, "") }
 
-func (c *callbacks) before(scope *gorm.Scope) {
-	val, ok := scope.Get(parentSpanGormKey)
-	if !ok {
-		return
-	}
-	parentSpan := val.(opentracing.Span)
-	tr := parentSpan.Tracer()
-	sp := tr.StartSpan("sql", opentracing.ChildOf(parentSpan.Context()))
-	ext.DBType.Set(sp, "sql")
-	scope.Set(spanGormKey, sp)
+func (c *callbacks) before(db *gorm.DB) {
+	span, _ := opentracing.StartSpanFromContext(db.Statement.Context, parentSpanGormKey)
+	db.InstanceSet(spanGormKey, span)
+	return
 }
 
-func (c *callbacks) after(scope *gorm.Scope, operation string) {
-	val, ok := scope.Get(spanGormKey)
+func (c *callbacks) after(db *gorm.DB, operation string) {
+	val, ok := db.Get(spanGormKey)
 	if !ok {
 		return
 	}
 	sp := val.(opentracing.Span)
 	if operation == "" {
-		operation = strings.ToUpper(strings.Split(scope.SQL, " ")[0])
+		operation = strings.ToUpper(strings.Split(db.Statement.SQL.String(), " ")[0])
 	}
-	ext.Error.Set(sp, scope.HasError())
-	ext.DBStatement.Set(sp, scope.SQL)
-	sp.SetTag("db.table", scope.TableName())
+	if db.Error != nil {
+		ext.Error.Set(sp, true)
+	} else {
+		ext.Error.Set(sp, false)
+	}
+	ext.DBStatement.Set(sp, db.Dialector.Explain(db.Statement.SQL.String(), db.Statement.Vars...))
+	sp.SetTag("db.table", db.Statement.Table)
 	sp.SetTag("db.method", operation)
-	sp.SetTag("db.err", scope.HasError())
-	sp.SetTag("db.count", scope.DB().RowsAffected)
+	sp.SetTag("db.count", db.Statement.RowsAffected)
+	sp.SetTag("db.err", db.Error)
+
 	sp.Finish()
 }
 
@@ -103,7 +101,7 @@ func registerCallbacks(db *gorm.DB, name string, c *callbacks) {
 		db.Callback().Delete().Before(gormCallbackName).Register(beforeName, c.beforeDelete)
 		db.Callback().Delete().After(gormCallbackName).Register(afterName, c.afterDelete)
 	case "row_query":
-		db.Callback().RowQuery().Before(gormCallbackName).Register(beforeName, c.beforeRowQuery)
-		db.Callback().RowQuery().After(gormCallbackName).Register(afterName, c.afterRowQuery)
+		db.Callback().Raw().Before(gormCallbackName).Register(beforeName, c.beforeRowQuery)
+		db.Callback().Raw().After(gormCallbackName).Register(afterName, c.afterRowQuery)
 	}
 }

@@ -2,20 +2,22 @@ package otgorm_test
 
 import (
 	"context"
-	"testing"
-
-	"github.com/jinzhu/gorm"
-	_ "github.com/jinzhu/gorm/dialects/sqlite"
+	otgorm "github.com/Ca2OH4/opentracing-gorm"
 	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/mocktracer"
-	otgorm "github.com/smacker/opentracing-gorm"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
+	"io"
+	"testing"
 )
 
-var tracer *mocktracer.MockTracer
+var tracer opentracing.Tracer
+var closer io.Closer
 var gDB *gorm.DB
 
 func init() {
 	gDB = initDB()
+
 	tracer = mocktracer.New()
 	opentracing.SetGlobalTracer(tracer)
 }
@@ -26,12 +28,14 @@ type Product struct {
 }
 
 func initDB() *gorm.DB {
-	db, err := gorm.Open("sqlite3", ":memory:")
+	db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
 	if err != nil {
 		panic(err)
 	}
 	db.AutoMigrate(&Product{})
 	db.Create(&Product{Code: "L1212"})
+	db.Use()
+	//otgorm.AddGormCallbacks(db)
 	otgorm.AddGormCallbacks(db)
 	return db
 }
