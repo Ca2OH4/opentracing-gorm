@@ -11,9 +11,12 @@ go get -u github.com/smacker/opentracing-gorm
 ## Usage
 
 1. _ = db.Use(&otgorm.Plugin{})
-   2.span := opentracing.StartSpan("gormTracing unit test")
-   3.ctx := opentracing.ContextWithSpan(context.Background(), span)
-   4.session := db.WithContext(ctx)
+
+2.span := opentracing.StartSpan("gormTracing unit test")
+
+3.ctx := opentracing.ContextWithSpan(context.Background(), span)
+
+4.session := db.WithContext(ctx)
 
 Example:
 
