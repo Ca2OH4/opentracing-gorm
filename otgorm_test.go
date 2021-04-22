@@ -2,93 +2,90 @@ package otgorm_test
 
 import (
 	"context"
-	otgorm "github.com/Ca2OH4/opentracing-gorm"
 	"github.com/opentracing/opentracing-go"
-	"github.com/opentracing/opentracing-go/mocktracer"
+	"github.com/uber/jaeger-client-go/config"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"io"
+	otgorm "opentracing-gorm"
 	"testing"
+	"time"
 )
 
-var tracer opentracing.Tracer
-var closer io.Closer
-var gDB *gorm.DB
-
-func init() {
-	gDB = initDB()
-
-	tracer = mocktracer.New()
+func newJaegerTracer(serverName, agentHostPort string) (opentracing.Tracer, io.Closer, error) {
+	cfg := &config.Configuration{
+		ServiceName: serverName,
+		Sampler: &config.SamplerConfig{
+			Type:  "const",
+			Param: 1,
+		},
+		Reporter: &config.ReporterConfig{
+			LogSpans:            true,
+			BufferFlushInterval: 1 * time.Second,
+			LocalAgentHostPort:  agentHostPort,
+		},
+	}
+	tracer, closer, err := cfg.NewTracer()
+	if err != nil {
+		return nil, nil, err
+	}
+	// 设置全局 tracer
 	opentracing.SetGlobalTracer(tracer)
+	return tracer, closer, err
 }
 
 type Product struct {
 	gorm.Model
-	Code string
+	Code  string
+	Price float64
 }
 
 func initDB() *gorm.DB {
-	db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
+	db, err := gorm.Open(sqlite.Open("gorm.db"), &gorm.Config{})
 	if err != nil {
 		panic(err)
 	}
-	db.AutoMigrate(&Product{})
+	_ = db.Use(&otgorm.Plugin{})
+	_ = db.AutoMigrate(&Product{})
 	db.Create(&Product{Code: "L1212"})
-	db.Use()
-	//otgorm.AddGormCallbacks(db)
-	otgorm.AddGormCallbacks(db)
 	return db
 }
 
-func Handler(ctx context.Context) {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "handler")
+func TestOTGorm(t *testing.T) {
+	_, closer, err := newJaegerTracer(
+		"test-OTGorm", "127.0.0.1:6831",
+	)
+	defer closer.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	db := initDB()
+	// 生成新的Span - 注意将span结束掉，不然无法发送对应的结果
+	span := opentracing.StartSpan("gormTracing unit test")
 	defer span.Finish()
 
-	db := otgorm.SetSpanToGorm(ctx, gDB)
+	// 把生成的Root Span写入到Context上下文，获取一个子Context
+	// 通常在Web项目中，Root Span由中间件生成
+	ctx := opentracing.ContextWithSpan(context.Background(), span)
 
+	// 将上下文传入DB实例，生成Session会话
+	// 这样子就能把这个会话的全部信息反馈给Jaeger
+	session := db.WithContext(ctx)
+
+	// Create
+	session.Create(&Product{Code: "D42", Price: 100})
+
+	// Read
 	var product Product
-	db.First(&product, 1)
-}
+	session.First(&product, 1)                 // 根据整形主键查找
+	session.First(&product, "code = ?", "D42") // 查找 code 字段值为 D42 的记录
 
-func TestPool(t *testing.T) {
-	Handler(context.Background())
-	spans := tracer.FinishedSpans()
-	if len(spans) != 2 {
-		t.Fatalf("should be 2 finished spans but there are %d: %v", len(spans), spans)
-	}
+	// Update - 将 product 的 price 更新为 200
+	session.Model(&product).Update("Price", 200)
+	// Update - 更新多个字段
+	session.Model(&product).Updates(Product{Price: 200, Code: "F42"}) // 仅更新非零值字段
+	session.Model(&product).Updates(map[string]interface{}{"Price": 200, "Code": "F42"})
 
-	sqlSpan := spans[0]
-	if sqlSpan.OperationName != "sql" {
-		t.Errorf("first span operation should be sql but it's '%s'", sqlSpan.OperationName)
-	}
-
-	expectedTags := map[string]interface{}{
-		"error":        false,
-		"db.table":     "products",
-		"db.method":    "SELECT",
-		"db.type":      "sql",
-		"db.statement": `SELECT * FROM "products"  WHERE "products"."deleted_at" IS NULL AND (("products"."id" = 1)) ORDER BY "products"."id" ASC LIMIT 1`,
-		"db.err":       false,
-		"db.count":     int64(1),
-	}
-
-	sqlTags := sqlSpan.Tags()
-	if len(sqlTags) != len(expectedTags) {
-		t.Errorf("sql span should have %d tags but it has %d", len(expectedTags), len(sqlTags))
-	}
-
-	for name, expected := range expectedTags {
-		value, ok := sqlTags[name]
-		if !ok {
-			t.Errorf("sql span doesn't have tag '%s'", name)
-			continue
-		}
-		if value != expected {
-			t.Errorf("sql span tag '%s' should have value '%s' but it has '%s'", name, expected, value)
-		}
-	}
-
-	if spans[1].OperationName != "handler" {
-		t.Errorf("second span operation should be handler but it's '%s'", spans[1].OperationName)
-	}
+	// Delete - 删除 product
+	session.Delete(&product, 1)
 }
