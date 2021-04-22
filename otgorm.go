@@ -1,109 +1,76 @@
 package otgorm
 
 import (
-	"context"
-	"fmt"
-	"strings"
-
-	"github.com/jinzhu/gorm"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/opentracing/opentracing-go/ext"
+	"gorm.io/gorm"
+	"strings"
 )
 
 const (
 	parentSpanGormKey = "opentracingParentSpan"
 	spanGormKey       = "opentracingSpan"
+
+	callBackBeforeName = "opentracing:before"
+	callBackAfterName  = "opentracing:after"
 )
 
-// SetSpanToGorm sets span to gorm settings, returns cloned DB
-func SetSpanToGorm(ctx context.Context, db *gorm.DB) *gorm.DB {
-	if ctx == nil {
-		return db
-	}
-	parentSpan := opentracing.SpanFromContext(ctx)
-	if parentSpan == nil {
-		return db
-	}
-	return db.Set(parentSpanGormKey, parentSpan)
+// 生成子 span
+func before(db *gorm.DB) {
+	// 先从父级 span 生成子 span
+	span, _ := opentracing.StartSpanFromContext(db.Statement.Context, parentSpanGormKey)
+
+	// 利用 db 实例去传递 span
+	db.InstanceSet(spanGormKey, span)
+	return
 }
 
-// AddGormCallbacks adds callbacks for tracing, you should call SetSpanToGorm to make them work
-func AddGormCallbacks(db *gorm.DB) {
-	callbacks := newCallbacks()
-	registerCallbacks(db, "create", callbacks)
-	registerCallbacks(db, "query", callbacks)
-	registerCallbacks(db, "update", callbacks)
-	registerCallbacks(db, "delete", callbacks)
-	registerCallbacks(db, "row_query", callbacks)
-}
-
-type callbacks struct{}
-
-func newCallbacks() *callbacks {
-	return &callbacks{}
-}
-
-func (c *callbacks) beforeCreate(scope *gorm.Scope)   { c.before(scope) }
-func (c *callbacks) afterCreate(scope *gorm.Scope)    { c.after(scope, "INSERT") }
-func (c *callbacks) beforeQuery(scope *gorm.Scope)    { c.before(scope) }
-func (c *callbacks) afterQuery(scope *gorm.Scope)     { c.after(scope, "SELECT") }
-func (c *callbacks) beforeUpdate(scope *gorm.Scope)   { c.before(scope) }
-func (c *callbacks) afterUpdate(scope *gorm.Scope)    { c.after(scope, "UPDATE") }
-func (c *callbacks) beforeDelete(scope *gorm.Scope)   { c.before(scope) }
-func (c *callbacks) afterDelete(scope *gorm.Scope)    { c.after(scope, "DELETE") }
-func (c *callbacks) beforeRowQuery(scope *gorm.Scope) { c.before(scope) }
-func (c *callbacks) afterRowQuery(scope *gorm.Scope)  { c.after(scope, "") }
-
-func (c *callbacks) before(scope *gorm.Scope) {
-	val, ok := scope.Get(parentSpanGormKey)
-	if !ok {
-		return
-	}
-	parentSpan := val.(opentracing.Span)
-	tr := parentSpan.Tracer()
-	sp := tr.StartSpan("sql", opentracing.ChildOf(parentSpan.Context()))
-	ext.DBType.Set(sp, "sql")
-	scope.Set(spanGormKey, sp)
-}
-
-func (c *callbacks) after(scope *gorm.Scope, operation string) {
-	val, ok := scope.Get(spanGormKey)
+// 获取追踪数据
+func after(db *gorm.DB) {
+	// 从 db 实例中取出 span
+	val, ok := db.InstanceGet(spanGormKey)
 	if !ok {
 		return
 	}
 	sp := val.(opentracing.Span)
-	if operation == "" {
-		operation = strings.ToUpper(strings.Split(scope.SQL, " ")[0])
+	method := strings.ToUpper(strings.Split(db.Statement.SQL.String(), " ")[0])
+	if db.Error != nil || db.Statement.Error != nil {
+		ext.Error.Set(sp, true)
+	} else {
+		ext.Error.Set(sp, false)
 	}
-	ext.Error.Set(sp, scope.HasError())
-	ext.DBStatement.Set(sp, scope.SQL)
-	sp.SetTag("db.table", scope.TableName())
-	sp.SetTag("db.method", operation)
-	sp.SetTag("db.err", scope.HasError())
-	sp.SetTag("db.count", scope.DB().RowsAffected)
+	ext.DBStatement.Set(sp, db.Dialector.Explain(db.Statement.SQL.String(), db.Statement.Vars...))
+	sp.SetTag("db.table", db.Statement.Table)
+	sp.SetTag("db.method", method)
+	sp.SetTag("db.count", db.Statement.RowsAffected)
+	sp.SetTag("db.err", db.Error)
+	sp.SetTag("db.statement.err", db.Statement.Error)
+
 	sp.Finish()
 }
 
-func registerCallbacks(db *gorm.DB, name string, c *callbacks) {
-	beforeName := fmt.Sprintf("tracing:%v_before", name)
-	afterName := fmt.Sprintf("tracing:%v_after", name)
-	gormCallbackName := fmt.Sprintf("gorm:%v", name)
-	// gorm does some magic, if you pass CallbackProcessor here - nothing works
-	switch name {
-	case "create":
-		db.Callback().Create().Before(gormCallbackName).Register(beforeName, c.beforeCreate)
-		db.Callback().Create().After(gormCallbackName).Register(afterName, c.afterCreate)
-	case "query":
-		db.Callback().Query().Before(gormCallbackName).Register(beforeName, c.beforeQuery)
-		db.Callback().Query().After(gormCallbackName).Register(afterName, c.afterQuery)
-	case "update":
-		db.Callback().Update().Before(gormCallbackName).Register(beforeName, c.beforeUpdate)
-		db.Callback().Update().After(gormCallbackName).Register(afterName, c.afterUpdate)
-	case "delete":
-		db.Callback().Delete().Before(gormCallbackName).Register(beforeName, c.beforeDelete)
-		db.Callback().Delete().After(gormCallbackName).Register(afterName, c.afterDelete)
-	case "row_query":
-		db.Callback().RowQuery().Before(gormCallbackName).Register(beforeName, c.beforeRowQuery)
-		db.Callback().RowQuery().After(gormCallbackName).Register(afterName, c.afterRowQuery)
-	}
+type Plugin struct{}
+
+var _ gorm.Plugin = &Plugin{}
+
+func (p *Plugin) Name() string {
+	return "opentracingPlugin"
+}
+
+func (p *Plugin) Initialize(db *gorm.DB) (err error) {
+	db.Callback().Create().Before("gorm:before_create").Register(callBackBeforeName, before)
+	db.Callback().Query().Before("gorm:query").Register(callBackBeforeName, before)
+	db.Callback().Delete().Before("gorm:before_delete").Register(callBackBeforeName, before)
+	db.Callback().Update().Before("gorm:setup_reflect_value").Register(callBackBeforeName, before)
+	db.Callback().Row().Before("gorm:row").Register(callBackBeforeName, before)
+	db.Callback().Raw().Before("gorm:raw").Register(callBackBeforeName, before)
+
+	// 结束后
+	db.Callback().Create().After("gorm:after_create").Register(callBackAfterName, after)
+	db.Callback().Query().After("gorm:after_query").Register(callBackAfterName, after)
+	db.Callback().Delete().After("gorm:after_delete").Register(callBackAfterName, after)
+	db.Callback().Update().After("gorm:after_update").Register(callBackAfterName, after)
+	db.Callback().Row().After("gorm:row").Register(callBackAfterName, after)
+	db.Callback().Raw().After("gorm:raw").Register(callBackAfterName, after)
+	return
 }
